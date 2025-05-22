@@ -1,0 +1,114 @@
+const express = require('express');
+const { createConnection } = require('typeorm');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const dotenv = require('dotenv');
+const cors = require('cors');
+const { User } = require('./entities/User');
+const { Software } = require('./entities/Software');
+const { Request } = require('./entities/Request');
+
+dotenv.config();
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// Database connection
+createConnection({
+  type: 'postgres',
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  username: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || 'password',
+  database: process.env.DB_NAME || 'access_management',
+  entities: [User, Software, Request],
+  synchronize: true, // For development only
+}).then(() => console.log('Database connected')).catch(err => console.error(err));
+
+// Middleware to verify JWT
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ message: 'Token required' });
+
+  jwt.verify(token, process.env.JWT_SECRET || 'secret', (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+};
+
+// Middleware to check role
+const restrictTo = (...roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    next();
+  };
+};
+
+// Auth Routes
+app.post('/api/auth/signup', async (req, res) => {
+  const { username, password } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const userRepo = getRepository(User);
+  const user = userRepo.create({
+    username,
+    password: hashedPassword,
+    role: 'Employee',
+  });
+  await userRepo.save(user);
+  res.status(201).json({ message: 'User created' });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  const userRepo = getRepository(User);
+  const user = await userRepo.findOne({ where: { username } });
+  if (!user || !(await bcrypt.compare(password, user.password))) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
+  const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET || 'secret', { expiresIn: '1h' });
+  res.json({ token, role: user.role });
+});
+
+// Software Routes (Admin only)
+app.post('/api/software', authenticateToken, restrictTo('Admin'), async (req, res) => {
+  const { name, description, accessLevels } = req.body;
+  const softwareRepo = getRepository(Software);
+  const software = softwareRepo.create({ name, description, accessLevels });
+  await softwareRepo.save(software);
+  res.status(201).json({ message: 'Software created', software });
+});
+
+// Access Request Routes (Employee)
+app.post('/api/requests', authenticateToken, restrictTo('Employee'), async (req, res) => {
+  const { softwareId, accessType, reason } = req.body;
+  const requestRepo = getRepository(Request);
+  const softwareRepo = getRepository(Software);
+  const software = await softwareRepo.findOne({ where: { id: softwareId } });
+  if (!software) return res.status(404).json({ message: 'Software not found' });
+  const request = requestRepo.create({
+    user: { id: req.user.id },
+    software,
+    accessType,
+    reason,
+    status: 'Pending',
+  });
+  await requestRepo.save(request);
+  res.status(201).json({ message: 'Request submitted', request });
+});
+
+// Approve/Reject Requests (Manager)
+app.patch('/api/requests/:id', authenticateToken, restrictTo('Manager'), async (req, res) => {
+  const { status } = req.body;
+  const requestRepo = getRepository(Request);
+  const request = await requestRepo.findOne({ where: { id: req.params.id } });
+  if (!request) return res.status(404).json({ message: 'Request not found' });
+  request.status = status;
+  await requestRepo.save(request);
+  res.json({ message: `Request ${status}`, request });
+});
+
+app.listen(3000, () => console.log('Server running on port 3000'));
